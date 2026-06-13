@@ -43,6 +43,21 @@ function normalizeText(html: string): string {
 	return stripHtml(html).replace(/\s+/g, ' ').trim();
 }
 
+/** URL-encode pipe characters (|) in image src/srcset attributes within HTML.
+ *  Some image CDNs use | as a URL parameter separator, which can break
+ *  Markdown parsing when the pipe is interpreted as a table delimiter. */
+function encodeImageUrls(html: string): string {
+	return html.replace(/<img\s[^>]*>/gi, (tag) => {
+		return tag
+			.replace(/(src\s*=\s*")([^"]*)(")/gi, (_, prefix, url, suffix) => {
+				return `${prefix}${url.replace(/\|/g, '%7C')}${suffix}`;
+			})
+			.replace(/(srcset\s*=\s*")([^"]*)(")/gi, (_, prefix, url, suffix) => {
+				return `${prefix}${url.replace(/\|/g, '%7C')}${suffix}`;
+			});
+	});
+}
+
 interface ContentResponse {
 	content: string;
 	selectedHtml: string;
@@ -157,7 +172,7 @@ export async function initializePageContent(
 			content = processHighlights(content, highlights);
 		}
 
-		const markdownBody = createMarkdownContent(content, currentUrl);
+		const markdownBody = createMarkdownContent(encodeImageUrls(content), currentUrl);
 
 		const highlightsData = collapseGroupsForExport(highlights, c => createMarkdownContent(c, currentUrl));
 

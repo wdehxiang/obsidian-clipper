@@ -211,6 +211,37 @@ declare global {
 					selectedHtml = serializeChildren(div);
 				}
 
+				// Pre-process images to handle lazy-loaded data-src attributes.
+				// Many websites (WeChat, Medium, etc.) use data-src for lazy loading,
+				// and Defuddle may not capture the image if src is a placeholder.
+				document.querySelectorAll('img').forEach(img => {
+					const dataSrc = img.getAttribute('data-src');
+					const currentSrc = img.getAttribute('src');
+
+					if (dataSrc && (!currentSrc || (currentSrc.startsWith('data:image/') && currentSrc.length < 200))) {
+						try {
+							const absoluteUrl = new URL(dataSrc, document.baseURI).href;
+							img.setAttribute('src', absoluteUrl);
+						} catch (e) {
+							img.setAttribute('src', dataSrc);
+						}
+					}
+
+					const dataSrcset = img.getAttribute('data-srcset');
+					if (dataSrcset && !img.getAttribute('srcset')) {
+						const newSrcset = dataSrcset.split(',').map(src => {
+							const [url, size] = src.trim().split(' ');
+							try {
+								const absoluteUrl = new URL(url, document.baseURI).href;
+								return `${absoluteUrl}${size ? ' ' + size : ''}`;
+							} catch (e) {
+								return src;
+							}
+						}).join(', ');
+						img.setAttribute('srcset', newSrcset);
+					}
+				});
+
 				// Use parseAsync to ensure async variables like {{transcript}} are available.
 				// If it hangs (e.g. another extension has corrupted fetch), fall back to sync parse.
 				const defuddle = new Defuddle(document, { url: document.URL });
@@ -222,6 +253,89 @@ declare global {
 				const extractedContent: { [key: string]: string } = {
 					...defuddled.variables,
 				};
+
+				// If the Defuddle content is missing images that are present in the
+				// page's article container, use the container's full HTML instead.
+				// Defuddle's scoring algorithm penalizes image-heavy containers and
+				// may drop images that should be in the content.
+				const articleContainer = document.querySelector(
+					'#js_content, .rich_media_content, ' +
+					'#article-content, .article-content, ' +
+					'.post-content, .entry-content, ' +
+					'.article-body, .article_body, ' +
+					'.rich_media, #page-content, ' +
+					'.content-article, .post-body, ' +
+					'[class*="article_body"], [class*="post_body"], ' +
+					'#content, .content, ' +
+					'main, [role="main"], article, [role="article"], ' +
+					'#app, .app, .page-content, .main-content, ' +
+					'#main, .apphuh5mr5g2193, [class*="apphuh5mr5g2193"]'
+				);
+				let usedContainerHtml = false;
+				if (articleContainer) {
+					// Quick check: if container has images not in Defuddle's content, use it
+					const containerImgs = articleContainer.querySelectorAll('img[src], img[data-src]').length;
+					const contentImgCount = (defuddled.content.match(/<img[^>]*>/gi) || []).length;
+					if (containerImgs > contentImgCount) {
+						// Clone the container to avoid modifying the live page
+						const containerClone = document.createElement('div');
+						containerClone.innerHTML = articleContainer.innerHTML;
+						// Remove non-content elements
+						containerClone.querySelectorAll('script, style, noscript, iframe, object, embed').forEach(el => el.remove());
+						containerClone.querySelectorAll('*').forEach(el => el.removeAttribute('style'));
+						// Make relative URLs absolute
+						containerClone.querySelectorAll('[src], [href], [data-src], [data-srcset]').forEach(el => {
+							['src', 'href', 'srcset', 'data-src', 'data-srcset'].forEach(attr => {
+								const val = el.getAttribute(attr);
+								if (!val) return;
+								if (attr === 'srcset' || attr === 'data-srcset') {
+									const newSrcset = val.split(',').map(s => {
+										const [url, size] = s.trim().split(' ');
+										try { return `${new URL(url, document.baseURI).href}${size ? ' ' + size : ''}`; }
+										catch { return s; }
+									}).join(', ');
+									el.setAttribute(attr, newSrcset);
+								} else if (!val.startsWith('http') && !val.startsWith('data:') && !val.startsWith('#') && !val.startsWith('//')) {
+									try { el.setAttribute(attr, new URL(val, document.baseURI).href); }
+									catch { }
+								}
+							});
+						});
+						defuddled.content = containerClone.innerHTML;
+						usedContainerHtml = true;
+						console.log('[Obsidian Clipper] Using article container HTML (found', containerImgs, 'images)');
+					}
+				}
+
+				// Fallback: if no article container was used, supplement missing images
+				// by scanning the page and inserting missing ones at the end.
+				if (!usedContainerHtml && defuddled.content) {
+					const fallbackDoc = new DOMParser().parseFromString(defuddled.content, 'text/html');
+					const existingSrcs = new Set<string>();
+					fallbackDoc.querySelectorAll('img[src]').forEach(img => {
+						const s = img.getAttribute('src');
+						if (s) existingSrcs.add(s);
+					});
+					const missingHtml: string[] = [];
+					document.querySelectorAll('img').forEach(img => {
+						const src = img.getAttribute('src') || img.getAttribute('data-src') || '';
+						const alt = img.getAttribute('alt') || '';
+						if (!src || src.startsWith('data:') || existingSrcs.has(src)) return;
+						try {
+							const rect = (img as HTMLElement).getBoundingClientRect();
+							if (rect) {
+								const w = rect.width;
+								const h = rect.height;
+								if ((w > 0 && w < 33) || (h > 0 && h < 33)) return;
+							}
+						} catch (e) {}
+						missingHtml.push(`<p><img src="${src.replace(/"/g, '&quot;')}"${alt ? ` alt="${alt}"` : ''}></p>`);
+					});
+					if (missingHtml.length > 0) {
+						defuddled.content += missingHtml.join('');
+						console.log('[Obsidian Clipper] Fallback: appended', missingHtml.length, 'missing images');
+					}
+				}
 
 				// Create a new DOMParser
 				const parser = new DOMParser();
@@ -235,12 +349,12 @@ declare global {
 				doc.querySelectorAll('*').forEach(el => el.removeAttribute('style'));
 
 				// Convert all relative URLs to absolute
-				doc.querySelectorAll('[src], [href]').forEach(element => {
-					['src', 'href', 'srcset'].forEach(attr => {
+				doc.querySelectorAll('[src], [href], [data-src], [data-srcset]').forEach(element => {
+					['src', 'href', 'srcset', 'data-src', 'data-srcset'].forEach(attr => {
 						const value = element.getAttribute(attr);
 						if (!value) return;
 
-						if (attr === 'srcset') {
+						if (attr === 'srcset' || attr === 'data-srcset') {
 							const newSrcset = value.split(',').map(src => {
 								const [url, size] = src.trim().split(' ');
 								try {
