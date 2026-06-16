@@ -34,6 +34,52 @@ declare global {
 	const iframeId = 'obsidian-clipper-iframe';
 	const containerId = 'obsidian-clipper-container';
 
+	/**
+	 * Remove non-content elements from the page before Defuddle extraction.
+	 * Handles site-specific known layouts where Defuddle's auto-detection
+	 * picks up comments, sidebars, and other clutter.
+	 */
+	function cleanPageForClipping(doc: Document) {
+		try {
+			const url = new URL(doc.URL);
+			const hostname = url.hostname;
+
+			// --- Zhihu (zhihu.com) ---
+			if (hostname.includes('zhihu.com')) {
+				// Remove the right sidebar (AuthorCard, HotSearchCard, etc.)
+				doc.querySelector('.Post-Row-Content-right')?.remove();
+
+				// Remove the "推荐阅读" recommendations section
+				doc.querySelector('.Post-Sub.Post-NormalSub')?.remove();
+
+				// Remove the comments section (the div after the article)
+				const leftArticle = doc.querySelector('.Post-Row-Content-left-article');
+				if (leftArticle && leftArticle.children.length > 1) {
+					const commentsDiv = leftArticle.children[1];
+					if (commentsDiv) commentsDiv.remove();
+				}
+
+				// Remove non-content elements inside the article
+				const article = doc.querySelector('article.Post-Main');
+				if (article) {
+					// Remove the header (author info, likes, "收录于")
+					article.querySelector('.Post-Header')?.remove();
+					// Remove edit time metadata
+					article.querySelector('.ContentItem-time')?.remove();
+					// Remove topic tags
+					article.querySelector('.Post-topicsAndReviewer')?.remove();
+					// Remove ad / large image section
+					article.querySelector('.pc-article-answer-big-img')?.remove();
+					// Remove action buttons (last child - like, comment, share)
+					const lastChild = article.lastElementChild;
+					if (lastChild) lastChild.remove();
+				}
+			}
+		} catch (e) {
+			console.warn('[Obsidian Clipper] Error cleaning page:', e);
+		}
+	}
+
 	function removeContainer(container: HTMLElement) {
 		container.classList.add('is-closing');
 		updateSidebarWidth(document, null);
@@ -153,6 +199,9 @@ declare global {
 		if (request.action === "copyMarkdownToClipboard") {
 			flattenShadowDom(document).then(() => {
 				try {
+					// Clean up non-content elements for known sites before Defuddle parsing
+					cleanPageForClipping(document);
+
 					const defuddled = parseForClip(document);
 
 					// Convert HTML content to markdown
@@ -178,6 +227,9 @@ declare global {
 		if (request.action === "saveMarkdownToFile") {
 			flattenShadowDom(document).then(async () => {
 				try {
+					// Clean up non-content elements for known sites before Defuddle parsing
+					cleanPageForClipping(document);
+
 					const defuddled = parseForClip(document);
 					const markdown = createMarkdownContent(defuddled.content, document.URL);
 					const title = defuddled.title || document.title || 'Untitled';
@@ -241,6 +293,9 @@ declare global {
 						img.setAttribute('srcset', newSrcset);
 					}
 				});
+
+				// Clean up non-content elements for known sites before Defuddle parsing
+				cleanPageForClipping(document);
 
 				// Use parseAsync to ensure async variables like {{transcript}} are available.
 				// If it hangs (e.g. another extension has corrupted fetch), fall back to sync parse.
