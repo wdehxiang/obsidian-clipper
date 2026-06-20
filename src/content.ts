@@ -52,6 +52,133 @@ declare global {
 			// can resolve relative URLs against the original page URL.
 			try { Object.defineProperty(cleaned, 'URL', { value: doc.URL, configurable: true }); } catch {}
 
+			// --- WeChat MP (mp.weixin.qq.com) ---
+			// WeChat appends a tag-preview toast, a "reward/like author" footer
+			// (#content_bottom_area), the comment / discuss section
+			// (.rich_media_area_extra), and several modal dialogs (reward,
+			// discuss-more, PC QR code) after the actual article. Defuddle
+			// picks them up, producing trailing noise like "预览时标签不可点",
+			// "名称已清空", "微信扫一扫赞赏作者", "暂无留言", "写留言:" etc.
+			if (hostname.includes('mp.weixin.qq.com')) {
+				// The "tag is not clickable in preview" toast inside the article wrapper.
+				cleaned.querySelector('#js_tags_preview_toast')?.remove();
+				cleaned.querySelector('.article-tag__error-tips')?.remove();
+
+				// Bottom "reward / like author" area appended after the article body.
+				cleaned.querySelector('#content_bottom_area')?.remove();
+
+				// Comment / discuss section wrapper (contains "留言", "暂无留言",
+				// "1条留言", "已无更多数据", "发消息", "写留言:" etc.).
+				cleaned.querySelector('.rich_media_area_extra')?.remove();
+				cleaned.querySelector('#page_bottom_area')?.remove();
+				cleaned.querySelector('#js_cmt_container')?.remove();
+				cleaned.querySelector('#js_cmt_area')?.remove();
+				cleaned.querySelector('#js_msg_area')?.remove();
+				cleaned.querySelector('#js_bottom_form')?.remove();
+				cleaned.querySelectorAll('.appmsg_comment_con, .discuss_mod, .discuss_bottom_form, .discuss_container, .discuss_list, .discuss_form_input, .discuss_form_input__inner, .placeholder_container').forEach(el => el.remove());
+
+				// Reward / discuss-more modal dialogs (they contain the same
+				// "微信扫一扫赞赏作者", "名称已清空", keypad UI etc.).
+				cleaned.querySelectorAll('.reward_dialog, .discuss_more_dialog_wrp, .wx_bottom_modal_wrp').forEach(el => el.remove());
+
+				// PC-side floating QR code overlay.
+				cleaned.querySelector('#js_pc_qr_code')?.remove();
+				cleaned.querySelector('.qr_code_pc_outer')?.remove();
+
+				// "Continue sliding to see the next article" tip overlay.
+				cleaned.querySelector('#wx_stream_article_slide_tip')?.remove();
+				cleaned.querySelector('.wx_stream_article_slide_tip_wrp')?.remove();
+				cleaned.querySelectorAll('.wx_stream_article_slide_tip, .wx_stream_article_slide_tip_text').forEach(el => el.remove());
+
+				// WeChat "novel reader" promotional card inserted between article
+				// metadata and article body. Contains "在小说阅读器读本章" /
+				// "在小说阅读器中沉浸阅读" / "去阅读" etc. — not article content.
+				cleaned.querySelector('#js_novel_card')?.remove();
+				cleaned.querySelectorAll('.novel-card, .novel-info, .novel-cover-group, .novel-meta, .novel-description, [class*="novel-card"]').forEach(el => el.remove());
+
+				// WeChat editor blockquotes (the "mdnice编辑器" mdnice editor
+				// specifically) are styled as <section> elements with a
+				// distinctive `color: rgb(14, 136, 235)` inline style. The
+				// exact wrapper structure varies — some are single-chain
+				// nested sections, others sit deep inside the article body
+				// with several sibling sections at each level — so we use
+				// the style attribute as the primary marker and convert
+				// the styled leaf to <blockquote> directly.
+				const articleBody = cleaned.querySelector('#js_content');
+				if (articleBody) {
+					const converted = new Set<Element>();
+					const allSections = Array.from(articleBody.querySelectorAll('section'));
+					// Primary heuristic: mdnice blue callout color.
+					for (const section of allSections) {
+						const style = section.getAttribute('style') || '';
+						if (!/color:\s*rgb\(\s*14\s*,\s*136\s*,\s*235\s*\)/i.test(style)) continue;
+						if (converted.has(section)) continue;
+						const blockquote = cleaned.createElement('blockquote');
+						while (section.firstChild) {
+							blockquote.appendChild(section.firstChild);
+						}
+						section.replaceWith(blockquote);
+						converted.add(section);
+					}
+					// Fallback heuristic (non-mdnice blockquotes): single chain of
+					// nested <section> elements ending in a leaf whose content has
+					// no headings or figures (so we don't misidentify the main
+					// article body). Convert only the outermost such section.
+					// Skip candidates whose subtree contains a styled section —
+					// those are already handled by the primary heuristic.
+					// We check for either a remaining styled section OR a
+					// <blockquote> left behind by the primary heuristic (the
+					// original styled section has been replaced in the DOM).
+					const containsStyledOrBlockquote = (element: Element): boolean => {
+						if (element.tagName === 'BLOCKQUOTE') return true;
+						const style = element.getAttribute && element.getAttribute('style');
+						if (style && /color:\s*rgb\(\s*14\s*,\s*136\s*,\s*235\s*\)/i.test(style)) return true;
+						for (const child of Array.from(element.children)) {
+							if (containsStyledOrBlockquote(child)) return true;
+						}
+						return false;
+					};
+					const candidates: Element[] = [];
+					for (const section of allSections) {
+						if (converted.has(section)) continue;
+						if (containsStyledOrBlockquote(section)) continue;
+						const directSectionChildren = Array.from(section.children).filter((c: Element) => c.tagName === 'SECTION');
+						if (directSectionChildren.length !== 1) continue;
+						let leaf: Element | null = section;
+						while (leaf) {
+							const next: Element | undefined = Array.from(leaf.children).find((c: Element) => c.tagName === 'SECTION');
+							if (!next) break;
+							const nextSections = Array.from(next.children).filter((c: Element) => c.tagName === 'SECTION');
+							if (nextSections.length > 1) break;
+							leaf = next;
+						}
+						if (!leaf || leaf === section) continue;
+						if (containsStyledOrBlockquote(leaf)) continue;
+						const hasHeading = leaf.querySelector('h1, h2, h3, h4, h5, h6') !== null;
+						const hasFigure = leaf.querySelector('figure') !== null;
+						if (hasHeading || hasFigure) continue;
+						candidates.push(section);
+					}
+					const blockquoteRoots: Element[] = [];
+					for (const section of candidates) {
+						let parent: Element | null = section.parentElement;
+						let hasBlockquoteAncestor = false;
+						while (parent && parent !== articleBody) {
+							if (candidates.includes(parent)) { hasBlockquoteAncestor = true; break; }
+							parent = parent.parentElement;
+						}
+						if (!hasBlockquoteAncestor) blockquoteRoots.push(section);
+					}
+					for (const root of blockquoteRoots) {
+						if (converted.has(root)) continue;
+						const blockquote = cleaned.createElement('blockquote');
+						while (root.firstChild) {
+							blockquote.appendChild(root.firstChild);
+						}
+						root.replaceWith(blockquote);
+					}
+				}
+			}
 			// --- VuePress Vdoing theme (cloud.iocoder.cn, etc.) ---
 			// This theme renders navigation/sidebar/footer as visible page content
 			// that Defuddle incorrectly treats as main content.
