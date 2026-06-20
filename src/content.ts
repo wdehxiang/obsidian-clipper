@@ -100,7 +100,7 @@ declare global {
 				// and blockquote conversion below.
 				const articleBody = cleaned.querySelector('#js_content');
 
-				// WeChat mdnice code blocks (`<pre data-tool="mdnice编辑器"><code>...`)
+				// WeChat code blocks (`<pre data-tool="mdnice编辑器"><code>...`)
 				// use `<br />` elements (wrapped in empty `<span leaf="">`) for line
 				// breaks. When extracted via `textContent`, the `<br />` produces
 				// nothing, so all the code collapses onto a single line. Walk the
@@ -133,6 +133,38 @@ declare global {
 						const language = detectCodeLanguage(codeText);
 						if (language) {
 							codeEl.setAttribute('class', `language-${language}`);
+						}
+					});
+
+					// WeChat code blocks (`<pre class="code-snippet__js">`) contain
+					// multiple `<code>` elements directly adjacent to each other
+					// (no separator between them). Defuddle/Turndown merges them
+					// into a single code block, losing all but the first command.
+					// Merge all <code> contents into the first <code>, separated
+					// by real newlines, so the fenced code block preserves them
+					// as separate lines.
+					articleBody.querySelectorAll('pre.code-snippet__js').forEach(preEl => {
+						const codeElements = Array.from(preEl.querySelectorAll(':scope > code'));
+						if (codeElements.length <= 1) return;
+
+						// Collect the trimmed text of each <code>.
+						const texts = codeElements.map(codeEl => (codeEl.textContent || '').trim());
+
+						// Detect the programming language from the combined text
+						// and tag the first <code> with the matching class so
+						// Defuddle emits a fenced ```bash block instead of a
+						// bare ``` block.
+						const combined = texts.join('\n');
+						const language = detectCodeLanguage(combined);
+						if (language) {
+							codeElements[0].setAttribute('class', `language-${language}`);
+						}
+
+						// Put the combined text into the first <code>, then
+						// remove the rest.
+						codeElements[0].textContent = combined;
+						for (let i = codeElements.length - 1; i > 0; i--) {
+							codeElements[i].remove();
 						}
 					});
 				}
@@ -196,7 +228,8 @@ declare global {
 						if (containsStyledOrBlockquote(leaf)) continue;
 						const hasHeading = leaf.querySelector('h1, h2, h3, h4, h5, h6') !== null;
 						const hasFigure = leaf.querySelector('figure') !== null;
-						if (hasHeading || hasFigure) continue;
+						const hasCodeBlock = leaf.querySelector('pre, code') !== null;
+						if (hasHeading || hasFigure || hasCodeBlock) continue;
 						candidates.push(section);
 					}
 					const blockquoteRoots: Element[] = [];
