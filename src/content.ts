@@ -96,6 +96,47 @@ declare global {
 				cleaned.querySelector('#js_novel_card')?.remove();
 				cleaned.querySelectorAll('.novel-card, .novel-info, .novel-cover-group, .novel-meta, .novel-description, [class*="novel-card"]').forEach(el => el.remove());
 
+				// Get the article body once — reused for code-block normalization
+				// and blockquote conversion below.
+				const articleBody = cleaned.querySelector('#js_content');
+
+				// WeChat mdnice code blocks (`<pre data-tool="mdnice编辑器"><code>...`)
+				// use `<br />` elements (wrapped in empty `<span leaf="">`) for line
+				// breaks. When extracted via `textContent`, the `<br />` produces
+				// nothing, so all the code collapses onto a single line. Walk the
+				// code subtree and convert each `<br />` to a real `\n` text node
+				// so Defuddle/Turndown preserves the formatting.
+				if (articleBody) {
+					articleBody.querySelectorAll('pre[data-tool="mdnice编辑器"] code').forEach(codeEl => {
+						// Replace each <br /> with a unique placeholder before we read
+						// textContent, since textContent discards <br /> entirely.
+						const newlinePlaceholder = '\u0000OBSIDIAN_CLIPPER_BR\u0000';
+						const brs: Element[] = [];
+						const walker = cleaned.createTreeWalker(codeEl, NodeFilter.SHOW_ELEMENT);
+						let n: Node | null = walker.nextNode();
+						while (n) {
+							if ((n as Element).tagName === 'BR') brs.push(n as Element);
+							n = walker.nextNode();
+						}
+						for (const br of brs) {
+							br.replaceWith(cleaned.createTextNode(newlinePlaceholder));
+						}
+						// Flatten the code element to a single text node — this also
+						// strips the mdnice syntax-highlight `<span>` wrappers while
+						// preserving their text content (including the newlines).
+						const rawText = codeEl.textContent || '';
+						const codeText = rawText.split(newlinePlaceholder).join('\n');
+						codeEl.textContent = codeText;
+						// Detect the programming language from the code content and
+						// tag the <code> element with the matching class so Defuddle
+						// emits a fenced ```java block instead of a bare ``` block.
+						const language = detectCodeLanguage(codeText);
+						if (language) {
+							codeEl.setAttribute('class', `language-${language}`);
+						}
+					});
+				}
+
 				// WeChat editor blockquotes (the "mdnice编辑器" mdnice editor
 				// specifically) are styled as <section> elements with a
 				// distinctive `color: rgb(14, 136, 235)` inline style. The
@@ -104,7 +145,6 @@ declare global {
 				// with several sibling sections at each level — so we use
 				// the style attribute as the primary marker and convert
 				// the styled leaf to <blockquote> directly.
-				const articleBody = cleaned.querySelector('#js_content');
 				if (articleBody) {
 					const converted = new Set<Element>();
 					const allSections = Array.from(articleBody.querySelectorAll('section'));
@@ -261,6 +301,156 @@ declare global {
 			console.warn('[Obsidian Clipper] Error cleaning page:', e);
 			return doc;
 		}
+	}
+
+	/**
+	 * Heuristic programming-language detection for code-block content.
+	 * Used to tag WeChat mdnice code blocks (which don't carry a language
+	 * hint in the HTML) with a `language-xxx` class so Defuddle emits a
+	 * fenced ```xxx block instead of a bare ``` block.
+	 *
+	 * Returns an empty string when no pattern matches confidently.
+	 */
+	function detectCodeLanguage(code: string): string {
+		const t = code.trim();
+		if (!t) return '';
+		const has = (re: RegExp) => re.test(t);
+		const lines = t.split('\n');
+
+		// --- HTML / XML (before JSX/TSX, since JSX also has `<...>`) ---
+		if (has(/^<!DOCTYPE\s+html/i) || has(/<html[\s>]/i) || has(/<\/\s*html\s*>/i) ||
+			(has(/<head[\s>]/i) && has(/<body[\s>]/i))) {
+			return 'html';
+		}
+		if (/^<\?xml/.test(t) || has(/<\/\s*[a-zA-Z][\w:-]*\s*>/) && has(/xmlns[:=]/)) {
+			return 'xml';
+		}
+
+		// --- JSON ---
+		if (/^\s*\{[\s\S]*\}\s*$/.test(t) || /^\s*\[[\s\S]*\]\s*$/.test(t)) {
+			if (has(/"[^"\n]+"\s*:/)) return 'json';
+		}
+
+		// --- YAML (key: value, no leading `=` / `{` / `;`, optional `---`) ---
+		if (/^---\s*$/m.test(t) || (/^[ \t]*[\w.-]+\s*:\s+\S+/m.test(t) &&
+			!/[;{}]/.test(t) && /^[ \t]*- /m.test(t) || /^[ \t]*[\w.-]+\s*:\s/m.test(t))) {
+			if (!has(/[{};]/) && /^[ \t]*[\w.-]+\s*:\s/m.test(t)) return 'yaml';
+		}
+
+		// --- SQL (statement at start, common keywords) ---
+		if (has(/^\s*(SELECT|INSERT\s+INTO|UPDATE\s+\w+|DELETE\s+FROM|CREATE\s+(TABLE|INDEX|VIEW|OR\s+REPLACE)|ALTER\s+TABLE|DROP\s+(TABLE|INDEX|VIEW))\b/im)) {
+			return 'sql';
+		}
+
+		// --- Shell / Bash (shebang, or lots of $-prefixed commands) ---
+		if (/^#!\/bin\/(ba)?sh/.test(t)) return 'bash';
+		if (lines.filter(l => /^\s*(\$\s|\.\/|[a-zA-Z_][\w-]*\s*=\s*)/.test(l)).length >= 2 &&
+			!/[{};]/.test(t.replace(/\s/g, ''))) {
+			return 'bash';
+		}
+
+		// --- CSS (selector { property: value; } patterns) ---
+		if (has(/^[.#@\w\[\]'*=^$~\s,>+~-]+\{[\s\S]*?[\w-]+\s*:\s*[^;{}]+;/m) &&
+			!/[<>]/.test(t)) {
+			return 'css';
+		}
+
+		// --- Java (imports from java/javax/org/com, public class/interface, @annotations) ---
+		if (has(/\bimport\s+(java\.|javax\.|org\.|com\.|net\.|io\.)/) ||
+			has(/\b(public|private|protected|static|final|abstract)\s+(class|interface|enum|void|static)\b/) ||
+			has(/\b(public|private|protected)\s+\w[\w<>\[\],\s]*\s+\w+\s*\([^)]*\)\s*(throws\s+[\w.]+\s*)?\{/) ||
+			has(/@(Override|Autowired|RestController|Service|Repository|Component|Controller|Configuration|Bean|Resource|RequestMapping|GetMapping|PostMapping|PutMapping|DeleteMapping|PathVariable|RequestParam|RequestBody|SneakyThrows|DataPermission|UserDataPermission|AllArgsConstructor|NoArgsConstructor|Builder|Data|Value|EqualsAndHashCode|ToString|Getter|Setter|Slf4j|Log|SuppressWarnings|Deprecated)\b/) ||
+			has(/\bSystem\.(out|err)\.print/) ||
+			has(/\bnew\s+\w+\s*\(/) && has(/;$/m) ||
+			has(/<[A-Z]\w*>/) && has(/;\s*$/m) ||
+			// Short method-call snippet with generics (e.g. `service.list(Wrapper<T> q)`)
+			(has(/<[A-Z]\w*>/) && has(/\.\w+\s*\(/))) {
+			return 'java';
+		}
+
+		// --- Kotlin (fun main, val/var with type, @Composable) ---
+		if (has(/\bfun\s+\w+\s*\(/) && has(/\b(val|var)\s+\w+\s*[:=]/)) {
+			return 'kotlin';
+		}
+
+		// --- Scala (object/class with `def`, type annotations `:`) ---
+		if (has(/\b(object|trait)\s+\w+/) && has(/\bdef\s+\w+\s*\(/) && has(/:\s*(Int|String|Boolean|List|Option)\b/)) {
+			return 'scala';
+		}
+
+		// --- Go (package declaration + func with {) ---
+		if (has(/^\s*package\s+\w+/m) && has(/\bfunc\s+\w+\s*\(/) && has(/^\s*import\s*\(/m)) {
+			return 'go';
+		}
+
+		// --- Rust (fn main, let mut, ::<...>) ---
+		if (has(/\bfn\s+main\s*\(/) && has(/\blet\s+mut\s+\w+/)) {
+			return 'rust';
+		}
+
+		// --- Python (def/class with `:` at line end, `import x`, no `{` or `;`) ---
+		if (has(/^\s*def\s+\w+\s*\([^)]*\)\s*(->\s*[\w\[\], ]+)?\s*:/m) ||
+			has(/^\s*(async\s+)?def\s+\w+/m) ||
+			has(/^\s*class\s+\w+(\s*\(\s*\w+\s*\))?\s*:/m)) {
+			return 'python';
+		}
+		if (has(/^\s*from\s+[\w.]+\s+import\s+/m) && !has(/;\s*$/m) && !has(/[{}]/)) {
+			return 'python';
+		}
+		if (has(/^\s*import\s+\w+(\s+as\s+\w+)?\s*$/m) && !has(/[{};]/) &&
+			has(/:\s*$/m) && has(/^\s+[^\s]/m)) {
+			return 'python';
+		}
+
+		// --- TypeScript (type/interface/Enum before `=`, or : type annotations) ---
+		if (has(/^\s*(export\s+)?(interface|type)\s+\w+\s*[=<{]/m) ||
+			has(/^\s*(export\s+)?enum\s+\w+\s*\{/m) ||
+			has(/^\s*(export\s+)?type\s+\w+\s*=/m)) {
+			return 'typescript';
+		}
+		if (has(/:\s*(string|number|boolean|any|unknown|never|void|Record<|Array<|Promise<)\b/) &&
+			has(/^\s*(const|let|var|function|class|interface)\s/m) &&
+			!has(/;\s*$/m)) {
+			return 'typescript';
+		}
+
+		// --- JSX/TSX (<Component /> or return (<...>)) ---
+		if (has(/^\s*import\s+React\b/m) && has(/<\/?[A-Z]\w*/)) {
+			return has(/:\s*(string|number|boolean)\b/) ? 'tsx' : 'jsx';
+		}
+		if (has(/return\s*\(\s*<[A-Z]\w*/) || has(/<\/?[A-Z]\w*[\s>]/)) {
+			return has(/:\s*(string|number|boolean)\b/) ? 'tsx' : 'jsx';
+		}
+
+		// --- JavaScript (function/const/let/var with arrow or `;` lines) ---
+		if (has(/^\s*(export\s+)?(const|let|var)\s+\w+\s*[:=]/m) ||
+			has(/^\s*(export\s+)?(default\s+)?function\s+\w+\s*\(/) ||
+			has(/=>\s*[{(]/) ||
+			has(/require\s*\(\s*['"]/)) {
+			return 'javascript';
+		}
+
+		// --- C# (using System;, namespace, public class) ---
+		if (has(/\busing\s+System(\.[\w.]+)*\s*;/) && has(/\b(namespace|public\s+class)\s+\w+/)) {
+			return 'csharp';
+		}
+
+		// --- C / C++ (preprocessor + main) ---
+		if (has(/^\s*#include\s*[<"]/m) && (has(/\bint\s+main\s*\(/) || has(/std::/) || has(/printf\s*\(/))) {
+			return has(/std::|class\s+\w+\s*\{|template\s*</) ? 'cpp' : 'c';
+		}
+
+		// --- PHP (<?php or $variable) ---
+		if (/^<\?php/.test(t) || (has(/\$\w+\s*=/m) && has(/^\s*<\?php/m))) {
+			return 'php';
+		}
+
+		// --- Ruby (def with `end`, or `do |...|`) ---
+		if (has(/^\s*def\s+\w+[?!]?\s*$/m) && has(/^\s*end\s*$/m)) {
+			return 'ruby';
+		}
+
+		return '';
 	}
 
 	function removeContainer(container: HTMLElement) {
