@@ -38,29 +38,83 @@ declare global {
 	 * Remove non-content elements from the page before Defuddle extraction.
 	 * Handles site-specific known layouts where Defuddle's auto-detection
 	 * picks up comments, sidebars, and other clutter.
+	 *
+	 * Returns a CLONED document so the live page DOM is not mutated.
+	 * Otherwise the sidebar/header would be permanently deleted from the
+	 * real page after the user saves, leaving them unable to navigate.
 	 */
-	function cleanPageForClipping(doc: Document) {
+	function cleanPageForClipping(doc: Document): Document {
 		try {
 			const url = new URL(doc.URL);
 			const hostname = url.hostname;
+			const cleaned = doc.cloneNode(true) as Document;
+			// cloneNode strips custom URL property — restore it so Defuddle
+			// can resolve relative URLs against the original page URL.
+			try { Object.defineProperty(cleaned, 'URL', { value: doc.URL, configurable: true }); } catch {}
 
-			// --- Zhihu (zhihu.com) ---
+			// --- VuePress Vdoing theme (cloud.iocoder.cn, etc.) ---
+			// This theme renders navigation/sidebar/footer as visible page content
+			// that Defuddle incorrectly treats as main content.
+			if (hostname.includes('iocoder.cn') || hostname.includes('cloud.iocoder.cn')) {
+				// Remove the top navigation bar (repeated links)
+				cleaned.querySelector('header.navbar')?.remove();
+				// Remove the left sidebar with navigation tree (repeated links)
+				cleaned.querySelector('aside.sidebar')?.remove();
+				// Remove the right-side table of contents
+				cleaned.querySelector('.right-menu-wrapper')?.remove();
+				// Remove breadcrumb / article info
+				cleaned.querySelector('.articleInfo-wrap')?.remove();
+				// Remove bottom page slot (e.g. ad/social sections)
+				cleaned.querySelector('.page-slot-bottom')?.remove();
+				// Remove "Edit this page" link
+				cleaned.querySelector('.page-edit')?.remove();
+				// Remove prev/next page navigation
+				cleaned.querySelector('.page-nav-wapper')?.remove();
+				cleaned.querySelector('.page-nav')?.remove();
+				// Remove footer (copyright, theme info, read-mode buttons)
+				cleaned.querySelector('.footer')?.remove();
+				// Remove background mask / overlay elements
+				cleaned.querySelector('.mask')?.remove();
+				// Remove the floating theme-switcher button (跟随系统/浅色模式/...)
+				cleaned.querySelector('.buttons')?.remove();
+				// Remove the floating ad wrapper and its "×" close button
+				cleaned.querySelector('.custom-wrapper')?.remove();
+			}
+			// --- Quill editor code blocks (zsxq.com, etc.) ---
+			// Defuddle doesn't recognize `div.ql-code-block-container` (the Quill
+			// rich-text editor's code block markup) so it gets flattened into plain
+			// text. Convert it to <pre><code> first so Defuddle treats it as a
+			// fenced code block in Markdown.
+			cleaned.querySelectorAll('div.ql-code-block-container').forEach(container => {
+				const pre = cleaned.createElement('pre');
+				const code = cleaned.createElement('code');
+				const codeLines = container.querySelectorAll('.ql-code-block');
+				if (codeLines.length > 0) {
+					code.textContent = Array.from(codeLines)
+						.map(line => line.textContent || '')
+						.join('\n');
+				} else {
+					code.textContent = container.textContent || '';
+				}
+				pre.appendChild(code);
+				container.replaceWith(pre);
+			});
 			if (hostname.includes('zhihu.com')) {
 				// Remove the right sidebar (AuthorCard, HotSearchCard, etc.)
-				doc.querySelector('.Post-Row-Content-right')?.remove();
+				cleaned.querySelector('.Post-Row-Content-right')?.remove();
 
 				// Remove the "推荐阅读" recommendations section
-				doc.querySelector('.Post-Sub.Post-NormalSub')?.remove();
+				cleaned.querySelector('.Post-Sub.Post-NormalSub')?.remove();
 
 				// Remove the comments section (the div after the article)
-				const leftArticle = doc.querySelector('.Post-Row-Content-left-article');
+				const leftArticle = cleaned.querySelector('.Post-Row-Content-left-article');
 				if (leftArticle && leftArticle.children.length > 1) {
 					const commentsDiv = leftArticle.children[1];
 					if (commentsDiv) commentsDiv.remove();
 				}
 
 				// Remove non-content elements inside the article
-				const article = doc.querySelector('article.Post-Main');
+				const article = cleaned.querySelector('article.Post-Main');
 				if (article) {
 					// Remove the header (author info, likes, "收录于")
 					article.querySelector('.Post-Header')?.remove();
@@ -75,8 +129,10 @@ declare global {
 					if (lastChild) lastChild.remove();
 				}
 			}
+			return cleaned;
 		} catch (e) {
 			console.warn('[Obsidian Clipper] Error cleaning page:', e);
+			return doc;
 		}
 	}
 
@@ -199,10 +255,11 @@ declare global {
 		if (request.action === "copyMarkdownToClipboard") {
 			flattenShadowDom(document).then(() => {
 				try {
-					// Clean up non-content elements for known sites before Defuddle parsing
-					cleanPageForClipping(document);
+					// Clean up non-content elements for known sites before Defuddle parsing.
+					// cleanPageForClipping returns a clone so the live page DOM is preserved.
+					const cleanedDoc = cleanPageForClipping(document);
 
-					const defuddled = parseForClip(document);
+					const defuddled = parseForClip(cleanedDoc);
 
 					// Convert HTML content to markdown
 					const markdown = createMarkdownContent(defuddled.content, document.URL);
@@ -227,10 +284,11 @@ declare global {
 		if (request.action === "saveMarkdownToFile") {
 			flattenShadowDom(document).then(async () => {
 				try {
-					// Clean up non-content elements for known sites before Defuddle parsing
-					cleanPageForClipping(document);
+					// Clean up non-content elements for known sites before Defuddle parsing.
+					// cleanPageForClipping returns a clone so the live page DOM is preserved.
+					const cleanedDoc = cleanPageForClipping(document);
 
-					const defuddled = parseForClip(document);
+					const defuddled = parseForClip(cleanedDoc);
 					const markdown = createMarkdownContent(defuddled.content, document.URL);
 					const title = defuddled.title || document.title || 'Untitled';
 					const fileName = title.replace(/[/\\?%*:|"<>]/g, '-');
@@ -263,10 +321,15 @@ declare global {
 					selectedHtml = serializeChildren(div);
 				}
 
+				// Work on a cloned document so image preprocessing and site-specific
+				// cleanup never mutate the live page DOM. This keeps the sidebar,
+				// nav, etc. intact for the user to continue navigating.
+				const cleanedDoc = cleanPageForClipping(document);
+
 				// Pre-process images to handle lazy-loaded data-src attributes.
 				// Many websites (WeChat, Medium, etc.) use data-src for lazy loading,
 				// and Defuddle may not capture the image if src is a placeholder.
-				document.querySelectorAll('img').forEach(img => {
+				cleanedDoc.querySelectorAll('img').forEach(img => {
 					const dataSrc = img.getAttribute('data-src');
 					const currentSrc = img.getAttribute('src');
 
@@ -294,12 +357,9 @@ declare global {
 					}
 				});
 
-				// Clean up non-content elements for known sites before Defuddle parsing
-				cleanPageForClipping(document);
-
 				// Use parseAsync to ensure async variables like {{transcript}} are available.
 				// If it hangs (e.g. another extension has corrupted fetch), fall back to sync parse.
-				const defuddle = new Defuddle(document, { url: document.URL });
+				const defuddle = new Defuddle(cleanedDoc, { url: document.URL });
 				const parseTimeout = new Promise<never>((_, reject) =>
 					setTimeout(() => reject(new Error('parseAsync timeout')), 8000)
 				);
@@ -313,7 +373,7 @@ declare global {
 				// page's article container, use the container's full HTML instead.
 				// Defuddle's scoring algorithm penalizes image-heavy containers and
 				// may drop images that should be in the content.
-				const articleContainer = document.querySelector(
+				const articleContainer = cleanedDoc.querySelector(
 					'#js_content, .rich_media_content, ' +
 					'#article-content, .article-content, ' +
 					'.post-content, .entry-content, ' +
